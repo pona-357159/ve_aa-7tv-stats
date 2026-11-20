@@ -197,6 +197,8 @@
         let gridCardPool = new Map();
         let tableRowPool = new Map();
         let loadedImageUrls = new Set();
+        let frameReadyImageUrls = new Set();
+        let decodingImages = new WeakMap();
         let emoteLoadStates = new Map();
         let visibleEmoteIndices = new Set();
         const IMAGE_LOAD_TIMEOUT_MS = 6000;
@@ -206,10 +208,14 @@
         const INITIAL_IMAGE_LOAD_DELAY_MS = 200;
         const POST_LOAD_START_DELAY_MS = 100;
         const PRELOAD_STEP_DELAY_MS = 0;
+        const BACKGROUND_PRELOAD_PULSE_MS = 400;
         const PRELOAD_PAGE_DEPTH = 2;
+        const BACKGROUND_PRELOAD_PAGE_DEPTH = 1;
         const TABLE_PRELOAD_MULTIPLIER = 2;
         const MAX_CONCURRENT_PRELOAD_TASKS = 5;
+        const BACKGROUND_MAX_CONCURRENT_PRELOAD_TASKS = 1;
         const NAV_KEYS = new Set(["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
+        function isPageForeground() { return document.visibilityState !== "hidden" && document.hidden !== true; }
         function parse7tvFilterQuery(rawQuery) {
             const cleaned = String(rawQuery || "").trim();
             if (!cleaned) return { mode: "none", exactId: "", nameQuery: "" };
@@ -218,14 +224,20 @@
             if (/^[a-zA-Z0-9_-]{20,}$/.test(cleaned)) return { mode: "exact-id", exactId: cleaned.toLowerCase(), nameQuery: "" };
             return { mode: "name", exactId: "", nameQuery: cleaned.toLowerCase() };
         }
-        function getPreloadPageDepth() { return currentView === "table" ? PRELOAD_PAGE_DEPTH * TABLE_PRELOAD_MULTIPLIER : PRELOAD_PAGE_DEPTH; }
-        function getMaxConcurrentPreloadTasks() { return currentView === "table" ? MAX_CONCURRENT_PRELOAD_TASKS * TABLE_PRELOAD_MULTIPLIER : MAX_CONCURRENT_PRELOAD_TASKS; }
+        function getPreloadPageDepth() { const baseDepth = isPageForeground() ? PRELOAD_PAGE_DEPTH : BACKGROUND_PRELOAD_PAGE_DEPTH; return currentView === "table" ? baseDepth * TABLE_PRELOAD_MULTIPLIER : baseDepth; }
+        function getMaxConcurrentPreloadTasks() { if (!isPageForeground()) return BACKGROUND_MAX_CONCURRENT_PRELOAD_TASKS; return currentView === "table" ? MAX_CONCURRENT_PRELOAD_TASKS * TABLE_PRELOAD_MULTIPLIER : MAX_CONCURRENT_PRELOAD_TASKS; }
         function isTable1xImage(img, srcUrl) { if (currentView === "table" && !img.closest(".table-img-popover")) return true; return typeof srcUrl === "string" && /\/1x\.webp(?:\?|$)/i.test(srcUrl); }
         function isImageAlreadyCached(img, srcUrl) {
             if (!srcUrl) return false;
-            if (loadedImageUrls.has(srcUrl)) return true;
-            if (img && img.currentSrc === srcUrl && img.complete && img.naturalWidth > 0) return true;
-            if (img && img.src === srcUrl && img.complete && img.naturalWidth > 0) return true;
+            if (frameReadyImageUrls.has(srcUrl)) return true;
+            if (img && img.currentSrc === srcUrl && img.complete && img.naturalWidth > 0 && frameReadyImageUrls.has(srcUrl)) return true;
+            if (img && img.src === srcUrl && img.complete && img.naturalWidth > 0 && frameReadyImageUrls.has(srcUrl)) return true;
+            return false;
+        }
+        function hasFetchedBytes(img, srcUrl) {
+            if (!srcUrl) return false;
+            if (loadedImageUrls.has(srcUrl) || frameReadyImageUrls.has(srcUrl)) return true;
+            if (img && (img.currentSrc === srcUrl || img.src === srcUrl) && img.complete && img.naturalWidth > 0) return true;
             return false;
         }
         let viewportQueue = [];
@@ -236,6 +248,7 @@
         let initialLoadTimer = null;
         let postLoadTimer = null;
         let preloadTimer = null;
+        let backgroundPulseTimer = null;
         let rafId = null;
         let nextPreloadDir = "bottom";
         let pageLoadCompleted = document.readyState === "complete";
@@ -246,6 +259,20 @@
         let activeResourceEntries = 0;
         let debugUserScrolling = false;
         let debugUserScrollTimer = null;
+        function stopBackgroundPreloadPulse() {
+            if (backgroundPulseTimer) { clearInterval(backgroundPulseTimer); backgroundPulseTimer = null; }
+        }
+        function ensureBackgroundPreloadPulse() {
+            if (isPageForeground()) { stopBackgroundPreloadPulse(); return; }
+            if (backgroundPulseTimer) return;
+            backgroundPulseTimer = setInterval(() => {
+                if (isPageForeground()) { stopBackgroundPreloadPulse(); return; }
+                if (!pageLoadCompleted && document.readyState !== "complete") return;
+                pageLoadCompleted = true;
+                enforcePreloadConcurrencyLimit();
+                fillPreloadSlots();
+            }, BACKGROUND_PRELOAD_PULSE_MS);
+        }
         function clearInitialLoadTimer() {
             if (initialLoadTimer) { clearTimeout(initialLoadTimer); initialLoadTimer = null; }
             if (postLoadTimer) { clearTimeout(postLoadTimer); postLoadTimer = null; }
@@ -258,6 +285,7 @@
                     if (!initialLoadTimer && viewportQueue.length > 0) loadVisibleViewportImages();
                 }, POST_LOAD_START_DELAY_MS);
             }
+            ensureBackgroundPreloadPulse();
         }
         window.addEventListener("load", markPageLoadCompleted, { once: true });
         function setSkeletonLoadingState(img, loading) {
@@ -493,9 +521,27 @@
             if (preloadTimer) { clearTimeout(preloadTimer); preloadTimer = null; }
             if (resetState) { nextPreloadDir = "bottom"; preloadPromotedImages.clear(); }
         }
+        function enforcePreloadConcurrencyLimit() {
+            const maxSlots = getMaxConcurrentPreloadTasks();
+            if (preloadPromotedImages.size <= maxSlots) return;
+            const promotedList = Array.from(preloadPromotedImages);
+            while (promotedList.length > maxSlots) {
+                const demotedImg = promotedList.pop();
+                if (!demotedImg) break;
+                for (const entry of Array.from(inFlightImages)) {
+                    if (entry && entry.img === demotedImg && !priorityImages.has(demotedImg)) {
+                        abortSingleInFlightEntry(entry, true);
+                        break;
+                    }
+                }
+                preloadPromotedImages.delete(demotedImg);
+            }
+            scheduleDebugUpdate();
+        }
         function collectNextPreloadEmote(direction) {
             const vh = window.innerHeight || document.documentElement.clientHeight || 800;
             const maxPreloadOffset = vh * getPreloadPageDepth();
+            const isBg = !isPageForeground();
             const candidates = [];
             for (let i = 0; i < viewportQueue.length; i++) {
                 const img = viewportQueue[i];
@@ -503,7 +549,7 @@
                 const srcUrl = img.getAttribute("data-src");
                 if (!srcUrl || isStrictlyInViewport(img)) continue;
                 const rect = getVisualRect(img);
-                if (!rect) continue;
+                if (!rect) { if (isBg) candidates.push({ img, top: 0, left: i }); continue; }
                 if (direction === "bottom") {
                     const distBelow = rect.top - vh;
                     if (distBelow >= -1 && distBelow <= maxPreloadOffset) candidates.push({ img, top: rect.top, left: rect.left });
@@ -518,7 +564,8 @@
             return candidates[0].img;
         }
         function fillPreloadSlots() {
-            const hasVisiblePending = viewportQueue.some(img => img && img.isConnected && img.getAttribute("data-src") && isStrictlyInViewport(img));
+            enforcePreloadConcurrencyLimit();
+            const hasVisiblePending = isPageForeground() && viewportQueue.some(img => img && img.isConnected && img.getAttribute("data-src") && isStrictlyInViewport(img));
             if (hasVisiblePending) return;
             const maxSlots = getMaxConcurrentPreloadTasks();
             while (preloadPromotedImages.size < maxSlots) {
@@ -539,11 +586,83 @@
         }
         function scheduleNextPreloadStep() {
             if (preloadTimer) { clearTimeout(preloadTimer); preloadTimer = null; }
+            enforcePreloadConcurrencyLimit();
             if (preloadPromotedImages.size >= getMaxConcurrentPreloadTasks()) return;
-            const hasVisiblePending = viewportQueue.some(img => img && img.isConnected && img.getAttribute("data-src") && isStrictlyInViewport(img));
+            const hasVisiblePending = isPageForeground() && viewportQueue.some(img => img && img.isConnected && img.getAttribute("data-src") && isStrictlyInViewport(img));
             if (hasVisiblePending) return;
             if (PRELOAD_STEP_DELAY_MS <= 0) { fillPreloadSlots(); return; }
             preloadTimer = setTimeout(() => { preloadTimer = null; fillPreloadSlots(); }, PRELOAD_STEP_DELAY_MS);
+        }
+        function waitForDecodedFrames(img, srcUrl, isPriority, onReady) {
+            if (!img || !img.isConnected) { if (typeof onReady === "function") onReady(false); return; }
+            const fast1x = isTable1xImage(img, srcUrl);
+            const alreadyFrameReady = srcUrl ? frameReadyImageUrls.has(srcUrl) : false;
+            const maxSettleMs = fast1x ? TABLE_1X_SETTLE_MAX_MS : ANIM_SETTLE_MAX_MS;
+            const minSettleMs = fast1x ? 100 : 260;
+            const targetFrames = fast1x ? 4 : 14;
+            if (alreadyFrameReady && isPageForeground()) { if (typeof onReady === "function") onReady(true); return; }
+            let finished = false, rafHandle = null, guardTimer = null;
+            const token = Symbol("decode");
+            decodingImages.set(img, token);
+            const done = (ok) => {
+                if (finished) return; finished = true;
+                if (guardTimer) clearTimeout(guardTimer);
+                if (rafHandle && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(rafHandle);
+                if (decodingImages.get(img) === token) decodingImages.delete(img);
+                if (ok && srcUrl) { loadedImageUrls.add(srcUrl); frameReadyImageUrls.add(srcUrl); }
+                if (typeof onReady === "function") onReady(ok);
+            };
+            guardTimer = setTimeout(() => done(Boolean(img && img.isConnected && img.complete && img.naturalWidth > 0)), isPriority ? 900 : 1400);
+            const runFrameLoop = () => {
+                if (finished) return;
+                if (!img.isConnected) { done(false); return; }
+                if (!isPageForeground() && (img.complete && img.naturalWidth > 0)) { done(true); return; }
+                if (typeof window.requestAnimationFrame === "function") {
+                    const startTime = performance.now();
+                    let lastFrameTime = startTime, frameCount = 0, hasFrameDelta = false;
+                    const stepFrame = (now) => {
+                        if (finished) return;
+                        if (!img.isConnected) { done(false); return; }
+                        if (!isPageForeground() && (img.complete && img.naturalWidth > 0)) { done(true); return; }
+                        frameCount++;
+                        if (now - lastFrameTime > 4) hasFrameDelta = true;
+                        lastFrameTime = now;
+                        const elapsed = now - startTime;
+                        if (elapsed >= maxSettleMs || (frameCount >= targetFrames && hasFrameDelta && elapsed >= minSettleMs)) done(true);
+                        else rafHandle = window.requestAnimationFrame(stepFrame);
+                    };
+                    rafHandle = window.requestAnimationFrame(stepFrame);
+                } else done(true);
+            };
+            if (typeof img.decode === "function") img.decode().then(() => runFrameLoop(), () => runFrameLoop());
+            else runFrameLoop();
+        }
+        function decodeAndFinalizeImage(img, srcUrl, isPriority) {
+            if (!img || !img.isConnected) return;
+            const targetUrl = srcUrl || img.getAttribute("data-src") || img.currentSrc || img.getAttribute("src") || "";
+            if (!targetUrl) return;
+            img.removeAttribute("data-src");
+            if (img.getAttribute("src") !== targetUrl) img.src = targetUrl;
+            if (hasFetchedBytes(img, targetUrl)) loadedImageUrls.add(targetUrl);
+            if (!frameReadyImageUrls.has(targetUrl)) {
+                setSkeletonLoadingState(img, true);
+                setEmoteDebugState(img, "loading");
+            }
+            waitForDecodedFrames(img, targetUrl, isPriority, (ok) => {
+                if (!img.isConnected) return;
+                if (ok) {
+                    setSkeletonLoadingState(img, false);
+                    setEmoteDebugState(img, "loaded");
+                    window.handleImgLoad(img);
+                } else if (img.complete && img.naturalWidth === 0 && img.getAttribute("src")) {
+                    setEmoteDebugState(img, "loaded");
+                    window.handleImgError(img);
+                } else {
+                    setSkeletonLoadingState(img, false);
+                    setEmoteDebugState(img, "loaded");
+                    window.handleImgLoad(img);
+                }
+            });
         }
         function abortSingleInFlightEntry(entry, restorePending) {
             if (!entry) return;
@@ -558,42 +677,36 @@
             priorityImages.delete(img);
             if (restorePending && img && img.isConnected && srcUrl) {
                 if (!isImageAlreadyCached(img, srcUrl)) {
-                    img.removeAttribute("src");
+                    if (!hasFetchedBytes(img, srcUrl)) img.removeAttribute("src");
                     img.setAttribute("data-src", srcUrl);
                     resetSkeletonToIdle(img);
                     setEmoteDebugState(img, "idle");
                     if (!img.closest(".table-img-popover") && viewportQueue.indexOf(img) === -1) viewportQueue.push(img);
                 } else {
-                    loadedImageUrls.add(srcUrl);
-                    img.removeAttribute("data-src");
-                    setSkeletonLoadingState(img, false);
-                    setEmoteDebugState(img, "loaded");
-                    window.handleImgLoad(img);
+                    decodeAndFinalizeImage(img, srcUrl, false);
                 }
             }
         }
         function cancelOffscreenInFlightImages() {
+            const isBg = !isPageForeground();
             Array.from(inFlightImages).forEach(entry => {
                 const { img } = entry;
                 if (!img || !img.isConnected) { abortSingleInFlightEntry(entry, true); return; }
                 if (priorityImages.has(img)) return;
                 const keepPreloaded = preloadPromotedImages.has(img);
-                if (!keepPreloaded && !isStrictlyInViewport(img)) {
+                if (!keepPreloaded && (isBg || !isStrictlyInViewport(img))) {
                     abortSingleInFlightEntry(entry, true);
                 }
             });
+            enforcePreloadConcurrencyLimit();
             scheduleDebugUpdate();
         }
         function startViewportImage(img, isPriority) {
             if (!img || !img.isConnected) return;
             const srcUrl = img.getAttribute("data-src");
             if (!srcUrl) {
-                if (img.getAttribute("src") && img.complete && img.naturalWidth > 0) {
-                    loadedImageUrls.add(img.currentSrc || img.src);
-                    setSkeletonLoadingState(img, false);
-                    setEmoteDebugState(img, "loaded");
-                    window.handleImgLoad(img);
-                }
+                const activeUrl = img.currentSrc || img.getAttribute("src") || "";
+                if (activeUrl && img.complete && img.naturalWidth > 0) decodeAndFinalizeImage(img, activeUrl, isPriority);
                 return;
             }
             for (const entry of inFlightImages) { if (entry.img === img) return; }
@@ -612,22 +725,27 @@
                 if (entryRef) { clearTimeout(entryRef.timerId); if (entryRef.decodeGuardId) clearTimeout(entryRef.decodeGuardId); if (entryRef.frameRafId && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(entryRef.frameRafId); img.removeEventListener("load", onLoad); img.removeEventListener("error", onError); inFlightImages.delete(entryRef); }
                 preloadPromotedImages.delete(img);
                 priorityImages.delete(img);
-                if (failed) { setEmoteDebugState(img, "loaded"); window.handleImgError(img); } else { loadedImageUrls.add(srcUrl); setSkeletonLoadingState(img, false); setEmoteDebugState(img, "loaded"); window.handleImgLoad(img); }
+                if (failed) { setEmoteDebugState(img, "loaded"); window.handleImgError(img); } else { loadedImageUrls.add(srcUrl); frameReadyImageUrls.add(srcUrl); setSkeletonLoadingState(img, false); setEmoteDebugState(img, "loaded"); window.handleImgLoad(img); }
                 scheduleNextPreloadStep();
+                ensureBackgroundPreloadPulse();
             };
             const waitFullDecodeAndFrames = () => {
                 if (done || !entryRef || !inFlightImages.has(entryRef)) return;
-                if (fast1x || alreadyCached) { finish(false); return; }
+                loadedImageUrls.add(srcUrl);
+                if (fast1x || alreadyCached || !isPageForeground()) {
+                    if (isPageForeground() && typeof img.decode === "function") img.decode().then(() => finish(false), () => finish(false));
+                    else finish(false);
+                    return;
+                }
                 const afterDecode = () => {
                     if (done || !entryRef || !inFlightImages.has(entryRef)) return;
+                    if (!isPageForeground()) { finish(false); return; }
                     if (typeof window.requestAnimationFrame === "function") {
                         const startTime = performance.now();
-                        let lastFrameTime = startTime;
-                        let frameCount = 0;
-                        let hasFrameDelta = false;
+                        let lastFrameTime = startTime, frameCount = 0, hasFrameDelta = false;
                         const stepFrame = (now) => {
                             if (done || !entryRef || !inFlightImages.has(entryRef)) return;
-                            if (!img.isConnected) { finish(false); return; }
+                            if (!img.isConnected || !isPageForeground()) { finish(false); return; }
                             frameCount++;
                             if (now - lastFrameTime > 4) hasFrameDelta = true;
                             lastFrameTime = now;
@@ -660,12 +778,10 @@
             if (img.getAttribute("src") !== srcUrl) img.src = srcUrl;
             if (img.complete && img.naturalWidth > 0) {
                 loadedImageUrls.add(srcUrl);
-                setSkeletonLoadingState(img, false);
-                setEmoteDebugState(img, "loaded");
-                finish(false);
+                waitFullDecodeAndFrames();
                 return;
             }
-            if (!loadedImageUrls.has(srcUrl)) {
+            if (!frameReadyImageUrls.has(srcUrl)) {
                 setSkeletonLoadingState(img, true);
                 setEmoteDebugState(img, "loading");
             } else {
@@ -678,14 +794,7 @@
             if (!previewImg || !previewImg.isConnected) return;
             const srcUrl = previewImg.getAttribute("data-src") || previewImg.getAttribute("src") || "";
             if (!srcUrl) return;
-            if (isImageAlreadyCached(previewImg, srcUrl)) {
-                loadedImageUrls.add(srcUrl);
-                previewImg.removeAttribute("data-src");
-                if (!previewImg.getAttribute("src")) previewImg.src = srcUrl;
-                setSkeletonLoadingState(previewImg, false);
-                window.handleImgLoad(previewImg);
-                return;
-            }
+            if (isImageAlreadyCached(previewImg, srcUrl)) { decodeAndFinalizeImage(previewImg, srcUrl, true); return; }
             if (!previewImg.getAttribute("data-src")) return;
             clearPreloadSchedule(true);
             Array.from(inFlightImages).forEach(entry => {
@@ -695,25 +804,36 @@
             });
             startViewportImage(previewImg, true);
         }
+        function forceForegroundCompositorTick() {
+            if (!isPageForeground()) return;
+            const activeContainer = currentView === "grid" ? document.getElementById("gridViewContainer") : document.getElementById("tableViewContainer");
+            if (activeContainer) void activeContainer.offsetHeight;
+            if (typeof window.requestAnimationFrame === "function") {
+                window.requestAnimationFrame(() => {
+                    if (!isPageForeground()) return;
+                    const c = currentView === "grid" ? document.getElementById("gridViewContainer") : document.getElementById("tableViewContainer");
+                    if (c) void c.offsetWidth;
+                });
+            }
+        }
         function loadVisibleViewportImages() {
-            if (!pageLoadCompleted) return;
+            if (!pageLoadCompleted && document.readyState !== "complete") return;
+            pageLoadCompleted = true;
             cancelOffscreenInFlightImages();
+            const isBg = !isPageForeground();
             const visibleCandidates = [], offscreenQueue = [];
             for (let i = 0; i < viewportQueue.length; i++) {
                 const img = viewportQueue[i];
                 if (!img || !img.isConnected) continue;
-                const srcUrl = img.getAttribute("data-src");
+                const srcUrl = img.getAttribute("data-src") || img.getAttribute("src") || "";
                 if (!srcUrl) continue;
                 if (isImageAlreadyCached(img, srcUrl)) {
-                    loadedImageUrls.add(srcUrl);
-                    img.removeAttribute("data-src");
-                    if (!img.getAttribute("src")) img.src = srcUrl;
-                    setSkeletonLoadingState(img, false);
-                    setEmoteDebugState(img, "loaded");
-                    window.handleImgLoad(img);
+                    const qIdx = viewportQueue.indexOf(img);
+                    if (qIdx !== -1) { viewportQueue.splice(qIdx, 1); i--; }
+                    decodeAndFinalizeImage(img, srcUrl, false);
                     continue;
                 }
-                if (isStrictlyInViewport(img)) visibleCandidates.push(img);
+                if (!isBg && isStrictlyInViewport(img)) visibleCandidates.push(img);
                 else offscreenQueue.push(img);
             }
             visibleCandidates.sort(compareVisualOrder);
@@ -722,10 +842,34 @@
                 const candidate = visibleCandidates[i];
                 const idx = viewportQueue.indexOf(candidate);
                 if (idx !== -1) viewportQueue.splice(idx, 1);
-                startViewportImage(candidate, false);
+                startViewportImage(candidate, true);
             }
             scheduleNextPreloadStep();
+            ensureBackgroundPreloadPulse();
             scheduleDebugUpdate();
+        }
+        function restoreViewportImagesOnForeground() {
+            if (!isPageForeground()) return;
+            const activeContainer = currentView === "grid" ? document.getElementById("gridViewContainer") : document.getElementById("tableViewContainer");
+            if (!activeContainer || activeContainer.classList.contains("hidden")) return;
+            const imgs = Array.from(activeContainer.querySelectorAll("img")).filter(img => !img.closest(".table-img-popover"));
+            const visibleImgs = imgs.filter(img => isStrictlyInViewport(img)).sort(compareVisualOrder);
+            visibleImgs.forEach(img => {
+                const srcUrl = img.getAttribute("data-src") || img.currentSrc || img.getAttribute("src") || "";
+                if (!srcUrl) return;
+                if (img.getAttribute("data-src")) {
+                    if (viewportQueue.indexOf(img) === -1) viewportQueue.unshift(img);
+                    startViewportImage(img, true);
+                } else if (img.complete && img.naturalWidth > 0) {
+                    decodeAndFinalizeImage(img, srcUrl, true);
+                } else {
+                    img.setAttribute("data-src", srcUrl);
+                    if (viewportQueue.indexOf(img) === -1) viewportQueue.unshift(img);
+                    startViewportImage(img, true);
+                }
+            });
+            loadVisibleViewportImages();
+            forceForegroundCompositorTick();
         }
         function triggerViewportSync() {
             clearPreloadSchedule(true);
@@ -736,6 +880,25 @@
             } else { loadVisibleViewportImages(); }
             if (settleTimer) clearTimeout(settleTimer);
             settleTimer = setTimeout(() => { settleTimer = null; loadVisibleViewportImages(); }, SETTLE_SYNC_DELAY_MS);
+        }
+        function handleVisibilityChange() {
+            if (!pageLoadCompleted && document.readyState === "complete") pageLoadCompleted = true;
+            if (!pageLoadCompleted) return;
+            if (initialLoadTimer || postLoadTimer) clearInitialLoadTimer();
+            enforcePreloadConcurrencyLimit();
+            if (isPageForeground()) {
+                stopBackgroundPreloadPulse();
+                const hoveredWrapper = document.querySelector(".table-popover-wrapper:hover");
+                if (hoveredWrapper) {
+                    const previewImg = hoveredWrapper.querySelector(".table-img-popover img");
+                    if (previewImg) prioritizeTablePopoverImage(previewImg);
+                }
+                restoreViewportImagesOnForeground();
+            } else {
+                cancelOffscreenInFlightImages();
+                fillPreloadSlots();
+                ensureBackgroundPreloadPulse();
+            }
         }
         function handleNavigationKey(e) {
             if (!e || e.ctrlKey || e.metaKey || e.altKey || !NAV_KEYS.has(e.key)) return;
@@ -776,12 +939,8 @@
                 const srcUrl = img.getAttribute("data-src") || img.getAttribute("src") || "";
                 if (!srcUrl) return;
                 if (isImageAlreadyCached(img, srcUrl)) {
-                    loadedImageUrls.add(srcUrl);
-                    img.removeAttribute("data-src");
-                    if (!img.getAttribute("src")) img.src = srcUrl;
-                    setSkeletonLoadingState(img, false);
                     emoteLoadStates.set(dIdx, "loaded");
-                    window.handleImgLoad(img);
+                    decodeAndFinalizeImage(img, srcUrl, false);
                     return;
                 }
                 emoteLoadStates.set(dIdx, "idle");
@@ -796,9 +955,20 @@
             viewportQueue = Array.from(pendingSet);
             scheduleDebugUpdate();
             if (viewportQueue.length > 0) {
-                scheduleInitialImageLoad();
+                if (!isPageForeground() && (pageLoadCompleted || document.readyState === "complete")) {
+                    pageLoadCompleted = true;
+                    fillPreloadSlots();
+                    ensureBackgroundPreloadPulse();
+                } else {
+                    scheduleInitialImageLoad();
+                }
+            } else {
+                stopBackgroundPreloadPulse();
             }
         }
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+        window.addEventListener("pageshow", (e) => { if (e && e.persisted) { pageLoadCompleted = true; restoreViewportImagesOnForeground(); } });
+        window.addEventListener("focus", () => { if (isPageForeground() && pageLoadCompleted) restoreViewportImagesOnForeground(); });
         window.addEventListener("scroll", triggerViewportSync, { passive: true });
         window.addEventListener("wheel", triggerViewportSync, { passive: true });
         window.addEventListener("resize", triggerViewportSync, { passive: true });
@@ -960,7 +1130,7 @@
             }
             document.getElementById("summaryPopularPct").textContent = formatNumber(coreEmotesCount) + " (" + coreEmotesPct + "%)";
         }
-        window.handleImgLoad = function(img) { if (!img) return; const loadedSrc = img.currentSrc || img.src || img.getAttribute("data-src") || ""; if (loadedSrc) loadedImageUrls.add(loadedSrc); setSkeletonLoadingState(img, false); img.classList.remove("opacity-0"); };
+        window.handleImgLoad = function(img) { if (!img) return; const loadedSrc = img.currentSrc || img.src || img.getAttribute("data-src") || ""; if (loadedSrc) { loadedImageUrls.add(loadedSrc); frameReadyImageUrls.add(loadedSrc); } setSkeletonLoadingState(img, false); img.classList.remove("opacity-0"); };
         window.handleImgError = function(img) {
             if (!img) return;
             const popover = img.closest(".table-img-popover");
@@ -1000,18 +1170,16 @@
                 existingImg.setAttribute("data-debug-idx", String(debugIdx));
                 const currentActiveSrc = existingImg.currentSrc || existingImg.getAttribute("src") || "";
                 const currentDataSrc = existingImg.getAttribute("data-src") || "";
-                if (currentActiveSrc === expectedUrl && existingImg.complete && existingImg.naturalWidth > 0) {
-                    loadedImageUrls.add(expectedUrl);
+                if (currentActiveSrc === expectedUrl && existingImg.complete && existingImg.naturalWidth > 0 && frameReadyImageUrls.has(expectedUrl)) {
                     existingImg.removeAttribute("data-src");
                     setSkeletonLoadingState(existingImg, false);
                     return existingImg;
                 }
                 if (currentActiveSrc !== expectedUrl && currentDataSrc !== expectedUrl) {
                     if (isImageAlreadyCached(existingImg, expectedUrl)) {
-                        loadedImageUrls.add(expectedUrl);
                         existingImg.removeAttribute("data-src");
                         existingImg.src = expectedUrl;
-                        setSkeletonLoadingState(existingImg, false);
+                        decodeAndFinalizeImage(existingImg, expectedUrl, false);
                     } else {
                         existingImg.removeAttribute("src");
                         existingImg.setAttribute("data-src", expectedUrl);
@@ -1026,10 +1194,9 @@
             imgEl.setAttribute("data-debug-idx", String(debugIdx));
             imgEl.className = decodingMode === "sync" ? "relative z-[1] max-w-8 max-h-8 w-auto h-auto shrink-0 block object-contain cursor-pointer" : "relative z-[1] max-h-14 max-w-full object-contain";
             if (isImageAlreadyCached(imgEl, expectedUrl)) {
-                loadedImageUrls.add(expectedUrl);
                 imgEl.src = expectedUrl;
                 imgBox.appendChild(imgEl);
-                setSkeletonLoadingState(imgEl, false);
+                decodeAndFinalizeImage(imgEl, expectedUrl, false);
             } else {
                 imgEl.setAttribute("data-src", expectedUrl);
                 imgBox.appendChild(imgEl);
@@ -1087,8 +1254,8 @@
                         pImg.alt = e.name;
                         const active4x = pImg.currentSrc || pImg.getAttribute("src") || "";
                         const data4x = pImg.getAttribute("data-src") || "";
-                        if (active4x === e.img4xUrl && pImg.complete && pImg.naturalWidth > 0) { loadedImageUrls.add(e.img4xUrl); pImg.removeAttribute("data-src"); setSkeletonLoadingState(pImg, false); }
-                        else if (isImageAlreadyCached(pImg, e.img4xUrl)) { loadedImageUrls.add(e.img4xUrl); pImg.removeAttribute("data-src"); if (pImg.getAttribute("src") !== e.img4xUrl) pImg.src = e.img4xUrl; setSkeletonLoadingState(pImg, false); }
+                        if (active4x === e.img4xUrl && pImg.complete && pImg.naturalWidth > 0 && frameReadyImageUrls.has(e.img4xUrl)) { pImg.removeAttribute("data-src"); setSkeletonLoadingState(pImg, false); }
+                        else if (isImageAlreadyCached(pImg, e.img4xUrl)) { pImg.removeAttribute("data-src"); if (pImg.getAttribute("src") !== e.img4xUrl) pImg.src = e.img4xUrl; decodeAndFinalizeImage(pImg, e.img4xUrl, true); }
                         else if (active4x !== e.img4xUrl && data4x !== e.img4xUrl) { pImg.removeAttribute("src"); pImg.setAttribute("data-src", e.img4xUrl); resetSkeletonToIdle(pImg); }
                     }
                 } else host4x.innerHTML = "";
